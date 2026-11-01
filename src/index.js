@@ -1,6 +1,7 @@
 const DEFAULT_THRESHOLD = 12;
 const DEFAULT_MODE = "alerts";
 
+
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);

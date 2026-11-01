@@ -1,9 +1,16 @@
-export function mainKeyboard(env = {}) {
-  const webappUrl = env.WEBAPP_URL || "https://tgguard.novogodniysait.workers.dev/app";
-  return { inline_keyboard: [
-    [{ text: "📺 Мои каналы", callback_data: "channels" }, { text: "🤖 База ботов", callback_data: "bots" }],
-    [{ text: "🌐 Открыть панель управления", web_app: { url: webappUrl } }]
-  ] };
+export function mainKeyboard(env = {}, origin = "") {
+  const rows = [
+    [
+      { text: "📺 Мои каналы", callback_data: "channels" },
+      { text: "🤖 База ботов", callback_data: "bots" },
+    ],
+  ];
+  // Prefer an explicit HTTPS URL; otherwise derive it from the incoming Worker request.
+  const candidate = String(env.WEBAPP_URL || (origin.startsWith("https://") ? `${origin}/app` : "")).trim();
+  if (/^https:\/\//i.test(candidate)) {
+    rows.push([{ text: "🌐 Открыть панель управления", web_app: { url: candidate } }]);
+  }
+  return { inline_keyboard: rows };
 }
 export function channelsKeyboard(channels = []) {
   const rows = channels.slice(0, 30).map(c => [{ text: `⚙️ ${String(c.title || c.id).slice(0, 48)}`, callback_data: `channel:${c.id}` }]);

@@ -22,7 +22,7 @@ export default {
     } catch {
       return json({ ok: false, error: "Invalid JSON" }, 400);
     }
-    ctx.waitUntil(handleUpdate(update, env));
+    ctx.waitUntil(handleUpdate(update, env, url.origin));
     return json({ ok: true });
   },
 };
@@ -34,13 +34,13 @@ function json(data, status = 200) {
   });
 }
 
-async function handleUpdate(update, env) {
+async function handleUpdate(update, env, publicOrigin = "") {
   try {
     if (update.my_chat_member) await handleBotMembership(update.my_chat_member, env);
     if (update.chat_join_request) await handleJoinRequest(update.chat_join_request, env);
     if (update.chat_member) await handleChatMember(update.chat_member, env);
-    if (update.message) await handlePrivateMessage(update.message, env);
-    if (update.callback_query) await handleCallbackQuery(update.callback_query, env);
+    if (update.message) await handlePrivateMessage(update.message, env, publicOrigin);
+    if (update.callback_query) await handleCallbackQuery(update.callback_query, env, publicOrigin);
   } catch (error) {
     console.error("Update failed:", error?.stack || error);
   }
@@ -170,7 +170,7 @@ async function recordBot(env, user, cfg, action) {
   await env.STATE.put(key, JSON.stringify(record));
 }
 
-async function handlePrivateMessage(message, env) {
+async function handlePrivateMessage(message, env, publicOrigin = "") {
   if (!message.text || message.chat?.type !== "private") return;
   const userId = String(message.from?.id || "");
   const chatId = message.chat.id;
@@ -180,21 +180,22 @@ async function handlePrivateMessage(message, env) {
   if (command === "/start" || command === "/help") {
     return sendMessage(env, chatId,
       "🛡 <b>Защита от накрутки</b>\n\nУправляйте каналами кнопками ниже. Вы видите только каналы, где вы администратор.\n\nℹ️ Telegram Bot API не сообщает дату создания аккаунта.",
-      { reply_markup: mainKeyboard(env) });
+      { reply_markup: mainKeyboard(env, publicOrigin) });
   }
 
   if (command === "/channels") {
     const channels = await listUserChannels(env, userId);
     if (!channels.length) {
       return sendMessage(env, chatId,
-        "У вас пока нет подключённых каналов, где бот является администратором и вы сами остаетесь администратором.");
+        "У вас пока нет подключённых каналов, где бот является администратором и вы сами остаетесь администратором.\n\nДобавьте бота администратором канала, затем нажмите «Мои каналы».",
+        { reply_markup: mainKeyboard(env, publicOrigin) });
     }
     const lines = channels.map(channel =>
       `• <b>${escapeHtml(channel.title)}</b> — <code>${escapeHtml(channel.id)}</code>` +
       (channel.username ? ` (@${escapeHtml(channel.username)})` : "") +
       `\n  Режим: <b>${escapeHtml(channel.mode)}</b>, порог: ${channel.threshold}`
     );
-    return sendMessage(env, chatId, "📺 <b>Ваши каналы:</b>\\n\\n" + lines.join("\\n\\n"),
+    return sendMessage(env, chatId, "📺 <b>Ваши каналы:</b>\n\n" + lines.join("\n\n"),
       { reply_markup: channelsKeyboard(channels) });
   }
 
@@ -202,7 +203,8 @@ async function handlePrivateMessage(message, env) {
     const channels = await listUserChannels(env, userId);
     const channelIds = new Set(channels.map(channel => String(channel.id)));
     if (!channelIds.size) {
-      return sendMessage(env, chatId, "Сначала подключите свой канал: добавьте бота администратором и отправьте /channels.");
+      return sendMessage(env, chatId, "Сначала подключите свой канал: добавьте бота администратором и откройте «Мои каналы».",
+        { reply_markup: mainKeyboard(env, publicOrigin) });
     }
     const records = await listBotRecords(env);
     const visible = records.filter(record =>
@@ -210,7 +212,8 @@ async function handlePrivateMessage(message, env) {
     ).sort((a, b) => String(b.lastSeenAt).localeCompare(String(a.lastSeenAt)));
 
     if (!visible.length) {
-      return sendMessage(env, chatId, "В базе пока нет Telegram-ботов, обнаруженных в ваших каналах.");
+      return sendMessage(env, chatId, "В базе пока нет Telegram-ботов, обнаруженных в ваших каналах.",
+        { reply_markup: mainKeyboard(env, publicOrigin) });
     }
     const lines = visible.slice(0, 30).map(record => {
       const name = userLabel(record);
@@ -294,14 +297,14 @@ async function handlePrivateMessage(message, env) {
 }
 
 
-async function handleCallbackQuery(query, env) {
+async function handleCallbackQuery(query, env, publicOrigin = "") {
   const data = String(query.data || ""), userId = String(query.from?.id || "");
   const chatId = query.message?.chat?.id, messageId = query.message?.message_id;
   await telegram(env, "answerCallbackQuery", { callback_query_id: query.id });
   if (!chatId || !messageId) return;
   if (data === "menu") return telegram(env, "editMessageText", {
     chat_id: chatId, message_id: messageId, text: "🛡 <b>Главное меню</b>\nВыберите раздел:",
-    parse_mode: "HTML", reply_markup: mainKeyboard(env)
+    parse_mode: "HTML", reply_markup: mainKeyboard(env, publicOrigin)
   });
   if (data === "channels") {
     const channels = await listUserChannels(env, userId);

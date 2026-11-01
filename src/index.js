@@ -5,6 +5,11 @@ const DEFAULT_THRESHOLD = 12;
 const DEFAULT_MODE = "alerts";
 
 export default {
+  async scheduled(controller, env, ctx) {
+    ctx.waitUntil(refreshAllSubscriberSnapshots(env).catch(error => {
+      console.error("Scheduled subscriber snapshot failed:", error?.stack || error);
+    }));
+  },
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     if (request.method === "GET" && url.pathname === "/") return json({ ok: true, service: "tgguard", status: "running", app: "/app" });
@@ -68,6 +73,9 @@ async function handleBotMembership(update, env) {
       enabled: true,
     };
     await env.STATE.put(channelKey(chat.id), JSON.stringify(cfg));
+    await refreshChannelSubscriberSnapshot(env, cfg).catch(error => {
+      console.error("Initial subscriber snapshot failed:", error?.stack || error);
+    });
     await notifyUsers(env, adminIds,
       `🛡 Бот подключён к каналу <b>${escapeHtml(cfg.title)}</b>.\n` +
       `Настройки: /channels. Режим по умолчанию — уведомления.`);
@@ -83,7 +91,7 @@ async function handleJoinRequest(join, env) {
   const count = await countJoin(env, join.chat.id);
   if (count >= cfg.threshold) {
     await notifyUsers(env, cfg.admins,
-      `⚠️ <b>Возможная накрутка</b>\nКанал: ${escapeHtml(cfg.title)}\nЗа минуту поступило ${count} заявок.`);
+      `⚠️ <b>Возможная подозрительная активность</b>\nКанал: ${escapeHtml(cfg.title)}\nЗа минуту поступило ${count} заявок на вступление.`);
   }
 
   const user = join.from;
@@ -106,10 +114,24 @@ async function handleJoinRequest(join, env) {
 async function handleChatMember(update, env) {
   const cfg = await getChannel(env, update.chat.id);
   if (!cfg?.enabled) return;
+
+  const oldMember = update.old_chat_member;
   const member = update.new_chat_member;
-  const user = member?.user;
-  const joined = ["member", "administrator", "creator"].includes(member?.status);
-  if (!user || !joined || user.is_bot !== true) return;
+  const user = member?.user || oldMember?.user;
+  if (!user) return;
+
+  const wasMember = isChatMemberPresent(oldMember);
+  const isMember = isChatMemberPresent(member);
+  const joined = !wasMember && isMember;
+  const left = wasMember && !isMember;
+
+  if (joined || left) {
+    await recordSubscriberTransition(env, cfg, user, joined ? "join" : "leave");
+  }
+
+  // Only treat a bot as a newly detected bot when it actually joins, not when its
+  // existing membership role changes from member to administrator, for example.
+  if (!joined || user.is_bot !== true) return;
 
   let action = "обнаружен";
   if (cfg.mode === "protect") {
@@ -124,6 +146,208 @@ async function handleChatMember(update, env) {
   await notifyUsers(env, cfg.admins,
     `🤖 В канале <b>${escapeHtml(cfg.title)}</b> ${action} Telegram-бот: ${userLabel(user)}.\n` +
     `ID: <code>${user.id}</code>\nБаза обнаруженных ботов: /bots`);
+}
+
+function isChatMemberPresent(member) {
+  if (!member) return false;
+  if (["creator", "administrator", "member"].includes(member.status)) return true;
+  return member.status === "restricted" && member.is_member === true;
+}
+
+async function recordSubscriberTransition(env, cfg, user, type) {
+  const now = Date.now();
+  const channelId = String(cfg.id);
+  const hourStart = Math.floor(now / 3600000) * 3600000;
+  const minuteStart = Math.floor(now / 60000) * 60000;
+  const isBot = user?.is_bot === true;
+
+  const hourKey = `analytics:hour:${channelId}:${timestampKey(hourStart)}`;
+  const hourRecord = await env.STATE.get(hourKey, "json") || {
+    channelId, timestamp: hourStart, joins: 0, leaves: 0, botJoins: 0, botLeaves: 0,
+  };
+  if (type === "join") {
+    hourRecord.joins = Number(hourRecord.joins || 0) + 1;
+    if (isBot) hourRecord.botJoins = Number(hourRecord.botJoins || 0) + 1;
+  } else {
+    hourRecord.leaves = Number(hourRecord.leaves || 0) + 1;
+    if (isBot) hourRecord.botLeaves = Number(hourRecord.botLeaves || 0) + 1;
+  }
+  await env.STATE.put(hourKey, JSON.stringify(hourRecord), { expirationTtl: 60 * 60 * 24 * 60 });
+
+  // Fine-grained counters are retained for 48 hours and used only for spike detection.
+  const minuteKey = `analytics:minute:${channelId}:${timestampKey(minuteStart)}`;
+  const minuteRecord = await env.STATE.get(minuteKey, "json") || {
+    channelId, timestamp: minuteStart, joins: 0, leaves: 0, botJoins: 0, botLeaves: 0,
+  };
+  if (type === "join") {
+    minuteRecord.joins = Number(minuteRecord.joins || 0) + 1;
+    if (isBot) minuteRecord.botJoins = Number(minuteRecord.botJoins || 0) + 1;
+  } else {
+    minuteRecord.leaves = Number(minuteRecord.leaves || 0) + 1;
+    if (isBot) minuteRecord.botLeaves = Number(minuteRecord.botLeaves || 0) + 1;
+  }
+  await env.STATE.put(minuteKey, JSON.stringify(minuteRecord), { expirationTtl: 60 * 60 * 48 });
+
+  // Without a configured cron trigger, active channels still get one count snapshot
+  // per hour as member events arrive. The dashboard can also force a fresh count.
+  const snapshotKey = `analytics:snapshot:${channelId}:${timestampKey(hourStart)}`;
+  if (!(await env.STATE.get(snapshotKey))) {
+    await refreshChannelSubscriberSnapshot(env, cfg).catch(error => {
+      console.error(`Subscriber snapshot failed for ${channelId}:`, error?.message || error);
+    });
+  }
+
+  const threshold = Math.max(2, Number(cfg.threshold) || DEFAULT_THRESHOLD);
+  if (type !== "join" || Number(minuteRecord.joins) < threshold) return;
+  const alertKey = `analytics:alert:${channelId}:${timestampKey(minuteStart)}`;
+  const existingAlert = await env.STATE.get(alertKey, "json");
+  if (existingAlert) {
+    if (Number(minuteRecord.joins) > Number(existingAlert.joins || 0)) {
+      existingAlert.joins = Number(minuteRecord.joins);
+      existingAlert.botJoins = Number(minuteRecord.botJoins || 0);
+      existingAlert.updatedAt = now;
+      await env.STATE.put(alertKey, JSON.stringify(existingAlert), { expirationTtl: 60 * 60 * 24 * 60 });
+    }
+    return;
+  }
+
+  const alert = {
+    channelId,
+    title: cfg.title || channelId,
+    timestamp: now,
+    bucketStart: minuteStart,
+    type: "subscriber_spike",
+    joins: Number(minuteRecord.joins),
+    threshold,
+    botJoins: Number(minuteRecord.botJoins || 0),
+  };
+  await env.STATE.put(alertKey, JSON.stringify(alert), { expirationTtl: 60 * 60 * 24 * 60 });
+  await notifyUsers(env, cfg.admins,
+    `⚠️ <b>Подозрительный всплеск подписок</b>\n` +
+    `Канал: <b>${escapeHtml(cfg.title)}</b>\n` +
+    `За одну минуту зафиксировано не менее ${alert.joins} новых участников (порог: ${threshold}).\n` +
+    `Это сигнал для проверки, а не автоматическое доказательство накрутки.`);
+}
+
+function timestampKey(value) {
+  return String(Math.trunc(Number(value))).padStart(13, "0");
+}
+
+async function saveSubscriberSnapshot(env, channelId, count, timestamp = Date.now()) {
+  const id = String(channelId);
+  const bucketStart = Math.floor(timestamp / 3600000) * 3600000;
+  const record = { channelId: id, count: Number(count), timestamp, bucketStart };
+  await env.STATE.put(
+    `analytics:snapshot:${id}:${timestampKey(bucketStart)}`,
+    JSON.stringify(record),
+    { expirationTtl: 60 * 60 * 24 * 60 },
+  );
+  return record;
+}
+
+async function refreshChannelSubscriberSnapshot(env, cfg) {
+  const result = await telegram(env, "getChatMemberCount", { chat_id: cfg.id });
+  if (!result.ok || !Number.isFinite(Number(result.result))) return null;
+  return saveSubscriberSnapshot(env, cfg.id, Number(result.result));
+}
+
+async function refreshAllSubscriberSnapshots(env) {
+  if (!env.BOT_TOKEN || !env.STATE) return;
+  let cursor;
+  do {
+    const page = await env.STATE.list({ prefix: "channel:", cursor, limit: 1000 });
+    const configs = [];
+    for (const key of page.keys) {
+      const cfg = await env.STATE.get(key.name, "json");
+      if (cfg?.enabled && cfg.id) configs.push(cfg);
+    }
+    // Keep concurrency bounded to avoid bursting Telegram's API rate limits.
+    for (let i = 0; i < configs.length; i += 10) {
+      await Promise.all(configs.slice(i, i + 10).map(cfg =>
+        refreshChannelSubscriberSnapshot(env, cfg).catch(error => {
+          console.error(`Subscriber snapshot failed for ${cfg.id}:`, error?.message || error);
+          return null;
+        })
+      ));
+    }
+    cursor = page.list_complete ? undefined : page.cursor;
+  } while (cursor);
+}
+
+async function readJsonPrefix(env, prefix) {
+  const records = [];
+  let cursor;
+  do {
+    const page = await env.STATE.list({ prefix, cursor, limit: 1000 });
+    const values = await Promise.all(page.keys.map(key => env.STATE.get(key.name, "json")));
+    for (const value of values) if (value) records.push(value);
+    cursor = page.list_complete ? undefined : page.cursor;
+  } while (cursor);
+  return records;
+}
+
+async function getChannelAnalytics(env, channel, refreshCurrent = true) {
+  const now = Date.now();
+  let freshSnapshot = null;
+  if (refreshCurrent) {
+    try { freshSnapshot = await refreshChannelSubscriberSnapshot(env, channel); }
+    catch (error) { console.error(`Could not refresh current count for ${channel.id}:`, error?.message || error); }
+  }
+  const id = String(channel.id);
+  const [snapshotsRaw, hourlyRaw, alertsRaw] = await Promise.all([
+    readJsonPrefix(env, `analytics:snapshot:${id}:`),
+    readJsonPrefix(env, `analytics:hour:${id}:`),
+    readJsonPrefix(env, `analytics:alert:${id}:`),
+  ]);
+  const cutoff30d = now - 30 * 24 * 60 * 60 * 1000;
+  const snapshotByBucket = new Map();
+  for (const item of snapshotsRaw) {
+    if (!Number.isFinite(Number(item.bucketStart)) || Number(item.bucketStart) < cutoff30d) continue;
+    snapshotByBucket.set(String(item.bucketStart), item);
+  }
+  if (freshSnapshot) snapshotByBucket.set(String(freshSnapshot.bucketStart), freshSnapshot);
+  const history = [...snapshotByBucket.values()]
+    .filter(item => Number.isFinite(Number(item.count)))
+    .sort((a, b) => Number(a.timestamp) - Number(b.timestamp))
+    .map(item => ({ timestamp: Number(item.bucketStart || Math.floor(Number(item.timestamp) / 3600000) * 3600000), count: Number(item.count) }));
+  const hourly = hourlyRaw
+    .filter(item => Number(item.timestamp) >= cutoff30d)
+    .sort((a, b) => Number(a.timestamp) - Number(b.timestamp)
+    ).map(item => ({
+      timestamp: Number(item.timestamp), joins: Number(item.joins || 0), leaves: Number(item.leaves || 0),
+      botJoins: Number(item.botJoins || 0), botLeaves: Number(item.botLeaves || 0),
+    }));
+  const alerts = alertsRaw
+    .filter(item => Number(item.timestamp) >= cutoff30d)
+    .sort((a, b) => Number(b.timestamp) - Number(a.timestamp))
+    .slice(0, 30)
+    .map(item => ({
+      timestamp: Number(item.timestamp), type: item.type || "subscriber_spike",
+      joins: Number(item.joins || 0), threshold: Number(item.threshold || channel.threshold || DEFAULT_THRESHOLD),
+      botJoins: Number(item.botJoins || 0), title: item.title || channel.title,
+    }));
+
+  const sumSince = (field, days) => hourly.reduce((sum, item) =>
+    sum + (item.timestamp >= now - days * 24 * 60 * 60 * 1000 ? Number(item[field] || 0) : 0), 0);
+  const currentCount = freshSnapshot?.count ?? history.at(-1)?.count ?? null;
+  const baseline = history.filter(item => item.timestamp <= now - 24 * 60 * 60 * 1000).at(-1);
+  return {
+    channelId: id,
+    title: channel.title || id,
+    username: channel.username || "",
+    currentCount,
+    countUpdatedAt: freshSnapshot?.timestamp ?? history.at(-1)?.timestamp ?? null,
+    history,
+    hourly,
+    alerts,
+    stats: {
+      joins24h: sumSince("joins", 1), leaves24h: sumSince("leaves", 1),
+      joins7d: sumSince("joins", 7), leaves7d: sumSince("leaves", 7),
+      joins30d: sumSince("joins", 30), leaves30d: sumSince("leaves", 30),
+      growth24h: currentCount !== null && baseline ? Number(currentCount) - Number(baseline.count) : null,
+      alerts30d: alertsRaw.filter(item => Number(item.timestamp) >= cutoff30d).length,
+    },
+  };
 }
 
 async function recordBot(env, user, cfg, action) {
@@ -264,7 +488,7 @@ async function handlePrivateMessage(message, env, publicOrigin = "") {
     const cfg = await authorizedConfig(env, args[0], userId);
     if (!cfg) return sendMessage(env, chatId, "Канал не найден или у вас нет прав администратора.");
     return sendMessage(env, chatId,
-      `🛡 <b>${escapeHtml(cfg.title)}</b>\nРежим: <b>${escapeHtml(cfg.mode)}</b>\nПорог: <b>${cfg.threshold}</b> заявок/минуту`);
+      `🛡 <b>${escapeHtml(cfg.title)}</b>\nРежим: <b>${escapeHtml(cfg.mode)}</b>\nПорог активности: <b>${cfg.threshold}</b> событий/минуту`);
   }
 
   if (command === "/mode") {
@@ -284,13 +508,13 @@ async function handlePrivateMessage(message, env, publicOrigin = "") {
     const threshold = Number(args[0]);
     const channelId = args[1];
     if (!Number.isInteger(threshold) || threshold < 2 || threshold > 1000 || !channelId) {
-      return sendMessage(env, chatId, "Использование: /threshold 12 ID_КАНАЛА (число от 2 до 1000)");
+      return sendMessage(env, chatId, "Использование: /threshold 12 ID_КАНАЛА (порог событий/мин, от 2 до 1000)");
     }
     const cfg = await authorizedConfig(env, channelId, userId);
     if (!cfg) return sendMessage(env, chatId, "Канал не найден или у вас нет прав администратора.");
     cfg.threshold = threshold;
     await env.STATE.put(channelKey(channelId), JSON.stringify(cfg));
-    return sendMessage(env, chatId, `Порог для <b>${escapeHtml(cfg.title)}</b>: ${threshold} заявок/минуту.`);
+    return sendMessage(env, chatId, `Порог активности для <b>${escapeHtml(cfg.title)}</b>: ${threshold} событий/минуту.`);
   }
 
   return sendMessage(env, chatId, "Неизвестная команда. Напишите /help.");
@@ -348,6 +572,11 @@ async function handleApi(request, env, url) {
   const user = await validateTelegramInitData(request.headers.get("X-Telegram-Init-Data") || "", env.BOT_TOKEN);
   if (!user) return json({ error: "Unauthorized Telegram WebApp session" }, 401);
   const userId = String(user.id);
+  if (request.method === "GET" && url.pathname === "/api/analytics") {
+    const channels = await listUserChannels(env, userId);
+    const analytics = await Promise.all(channels.map(channel => getChannelAnalytics(env, channel, true)));
+    return json({ analytics, generatedAt: new Date().toISOString() });
+  }
   if (request.method === "GET" && url.pathname === "/api/bootstrap") {
     const channels = await listUserChannels(env, userId), ids = new Set(channels.map(c => String(c.id)));
     const bots = (await listBotRecords(env)).filter(r => Object.keys(r.channels || {}).some(id => ids.has(id))).map(r => ({

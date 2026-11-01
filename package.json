@@ -1,0 +1,10 @@
+{
+  "name": "tgguard-worker",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build:webapp": "node scripts/build-webapp.mjs",
+    "check": "node --check src/index.js && node --check src/ui.js && node --check src/webapp.js && node scripts/check-webapp.mjs",
+    "test": "node tests/smoke-test.mjs"
+  }
+}

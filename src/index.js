@@ -1,12 +1,15 @@
+import { mainKeyboard, channelsKeyboard, channelActionsKeyboard } from "./ui.js";
+import { WEBAPP_HTML } from "./webapp.js";
+
 const DEFAULT_THRESHOLD = 12;
 const DEFAULT_MODE = "alerts";
 
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
-    if (request.method === "GET" && url.pathname === "/") {
-      return json({ ok: true, service: "tgguard", status: "running" });
-    }
+    if (request.method === "GET" && url.pathname === "/") return json({ ok: true, service: "tgguard", status: "running", app: "/app" });
+    if (request.method === "GET" && url.pathname === "/app") return new Response(WEBAPP_HTML, { headers: { "Content-Type": "text/html; charset=utf-8" } });
+    if (url.pathname.startsWith("/api/")) return handleApi(request, env, url);
     if (request.method !== "POST" || url.pathname !== "/telegram/webhook") {
       return json({ ok: false, error: "Not found" }, 404);
     }
@@ -37,6 +40,7 @@ async function handleUpdate(update, env) {
     if (update.chat_join_request) await handleJoinRequest(update.chat_join_request, env);
     if (update.chat_member) await handleChatMember(update.chat_member, env);
     if (update.message) await handlePrivateMessage(update.message, env);
+    if (update.callback_query) await handleCallbackQuery(update.callback_query, env);
   } catch (error) {
     console.error("Update failed:", error?.stack || error);
   }
@@ -175,16 +179,8 @@ async function handlePrivateMessage(message, env) {
 
   if (command === "/start" || command === "/help") {
     return sendMessage(env, chatId,
-      "🛡 <b>Защита от накрутки каналов</b>\n\n" +
-      "Добавьте бота администратором своего канала. Список ниже показывает только каналы, где вы сейчас администратор.\n\n" +
-      "/channels — ваши каналы\n" +
-      "/status ID — настройки канала\n" +
-      "/mode alerts ID — уведомления без авто-защиты\n" +
-      "/mode protect ID — автоматическая защита\n" +
-      "/threshold 12 ID — порог заявок в минуту\n" +
-      "/bots — база Telegram-ботов, обнаруженных в ваших каналах\n" +
-      "/bot ID — сведения об обнаруженном боте\n\n" +
-      "Важно: Telegram Bot API не сообщает дату создания аккаунта. Фото профиля может быть недоступно.");
+      "🛡 <b>Защита от накрутки</b>\n\nУправляйте каналами кнопками ниже. Вы видите только каналы, где вы администратор.\n\nℹ️ Telegram Bot API не сообщает дату создания аккаунта.",
+      { reply_markup: mainKeyboard(env) });
   }
 
   if (command === "/channels") {
@@ -198,7 +194,8 @@ async function handlePrivateMessage(message, env) {
       (channel.username ? ` (@${escapeHtml(channel.username)})` : "") +
       `\n  Режим: <b>${escapeHtml(channel.mode)}</b>, порог: ${channel.threshold}`
     );
-    return sendMessage(env, chatId, "📺 <b>Ваши каналы:</b>\n\n" + lines.join("\n\n"));
+    return sendMessage(env, chatId, "📺 <b>Ваши каналы:</b>\\n\\n" + lines.join("\\n\\n"),
+      { reply_markup: channelsKeyboard(channels) });
   }
 
   if (command === "/bots") {
@@ -296,6 +293,106 @@ async function handlePrivateMessage(message, env) {
   return sendMessage(env, chatId, "Неизвестная команда. Напишите /help.");
 }
 
+
+async function handleCallbackQuery(query, env) {
+  const data = String(query.data || ""), userId = String(query.from?.id || "");
+  const chatId = query.message?.chat?.id, messageId = query.message?.message_id;
+  await telegram(env, "answerCallbackQuery", { callback_query_id: query.id });
+  if (!chatId || !messageId) return;
+  if (data === "menu") return telegram(env, "editMessageText", {
+    chat_id: chatId, message_id: messageId, text: "🛡 <b>Главное меню</b>\nВыберите раздел:",
+    parse_mode: "HTML", reply_markup: mainKeyboard(env)
+  });
+  if (data === "channels") {
+    const channels = await listUserChannels(env, userId);
+    const text = channels.length ? "📺 <b>Ваши каналы</b>\n\n" + channels.map(c =>
+      `• <b>${escapeHtml(c.title)}</b>\nID: <code>${escapeHtml(c.id)}</code>\nРежим: ${escapeHtml(c.mode)} · порог: ${c.threshold}/мин`
+    ).join("\n\n") : "Каналы не найдены. Добавьте бота администратором канала.";
+    return telegram(env, "editMessageText", { chat_id: chatId, message_id: messageId, text, parse_mode: "HTML", reply_markup: channelsKeyboard(channels) });
+  }
+  if (data === "bots") {
+    const channels = await listUserChannels(env, userId), ids = new Set(channels.map(c => String(c.id)));
+    const records = (await listBotRecords(env)).filter(r => Object.keys(r.channels || {}).some(id => ids.has(id)))
+      .sort((a,b) => String(b.lastSeenAt).localeCompare(String(a.lastSeenAt))).slice(0, 20);
+    const text = records.length ? "🤖 <b>База обнаруженных ботов</b>\n\n" + records.map(r =>
+      `• ${userLabel(r)}\nID: <code>${escapeHtml(r.id)}</code>\nПоследнее обнаружение: ${escapeHtml(formatDate(r.lastSeenAt))}`
+    ).join("\n\n") : "В ваших каналах пока нет записей о ботах.";
+    return telegram(env, "editMessageText", { chat_id: chatId, message_id: messageId, text, parse_mode: "HTML",
+      reply_markup: { inline_keyboard: [[{ text: "↻ Обновить", callback_data: "bots" }, { text: "⬅️ Меню", callback_data: "menu" }]] } });
+  }
+  const channelMatch = data.match(/^channel:(-?\d+)$/);
+  const actionMatch = data.match(/^(mode_alerts|mode_protect|threshold_up|threshold_down):(-?\d+)$/);
+  const channelId = channelMatch?.[1] || actionMatch?.[2];
+  if (!channelId) return;
+  const cfg = await authorizedConfig(env, channelId, userId);
+  if (!cfg) return telegram(env, "editMessageText", { chat_id: chatId, message_id: messageId,
+    text: "⛔ Нет доступа к каналу. Проверьте права администратора.",
+    reply_markup: { inline_keyboard: [[{ text: "⬅️ Меню", callback_data: "menu" }]] } });
+  if (actionMatch) {
+    const action = actionMatch[1];
+    if (action === "mode_alerts") cfg.mode = "alerts";
+    if (action === "mode_protect") cfg.mode = "protect";
+    if (action === "threshold_up") cfg.threshold = Math.min(1000, cfg.threshold + 1);
+    if (action === "threshold_down") cfg.threshold = Math.max(2, cfg.threshold - 1);
+    await env.STATE.put(channelKey(channelId), JSON.stringify(cfg));
+  }
+  return telegram(env, "editMessageText", { chat_id: chatId, message_id: messageId,
+    text: `⚙️ <b>${escapeHtml(cfg.title)}</b>\n\nРежим: <b>${escapeHtml(cfg.mode)}</b>\nПорог заявок: <b>${cfg.threshold}/мин</b>\n\nProtect автоматически отклоняет заявки от аккаунтов, помеченных Telegram как боты.`,
+    parse_mode: "HTML", reply_markup: channelActionsKeyboard(cfg) });
+}
+
+async function handleApi(request, env, url) {
+  const user = await validateTelegramInitData(request.headers.get("X-Telegram-Init-Data") || "", env.BOT_TOKEN);
+  if (!user) return json({ error: "Unauthorized Telegram WebApp session" }, 401);
+  const userId = String(user.id);
+  if (request.method === "GET" && url.pathname === "/api/bootstrap") {
+    const channels = await listUserChannels(env, userId), ids = new Set(channels.map(c => String(c.id)));
+    const bots = (await listBotRecords(env)).filter(r => Object.keys(r.channels || {}).some(id => ids.has(id))).map(r => ({
+      id: r.id, firstName: r.firstName || "", lastName: r.lastName || "", username: r.username || "",
+      languageCode: r.languageCode || "", firstSeenAt: r.firstSeenAt || null, lastSeenAt: r.lastSeenAt || null,
+      channels: Object.entries(r.channels || {}).filter(([id]) => ids.has(id)).map(([,v]) => v)
+    }));
+    return json({ user: { id: user.id, first_name: user.first_name, username: user.username }, channels, bots });
+  }
+  if (request.method === "POST" && url.pathname === "/api/settings") {
+    let body; try { body = await request.json(); } catch { return json({ error: "Invalid JSON" }, 400); }
+    const cfg = await authorizedConfig(env, String(body.channelId || ""), userId);
+    if (!cfg) return json({ error: "Forbidden" }, 403);
+    if (body.mode !== undefined) {
+      if (!["alerts", "protect"].includes(body.mode)) return json({ error: "Invalid mode" }, 400);
+      cfg.mode = body.mode;
+    }
+    if (body.threshold !== undefined) {
+      const n = Number(body.threshold);
+      if (!Number.isInteger(n) || n < 2 || n > 1000) return json({ error: "Порог должен быть от 2 до 1000" }, 400);
+      cfg.threshold = n;
+    }
+    await env.STATE.put(channelKey(cfg.id), JSON.stringify(cfg));
+    return json({ ok: true, channel: cfg });
+  }
+  return json({ error: "Not found" }, 404);
+}
+
+async function validateTelegramInitData(initData, botToken) {
+  if (!initData || !botToken) return null;
+  try {
+    const params = new URLSearchParams(initData), hash = params.get("hash"), authDate = Number(params.get("auth_date"));
+    if (!hash || !authDate || Math.abs(Date.now()/1000 - authDate) > 86400) return null;
+    params.delete("hash");
+    const check = [...params.entries()].sort(([a],[b]) => a.localeCompare(b)).map(([k,v]) => `${k}=${v}`).join("\n");
+    const enc = new TextEncoder();
+    const key1 = await crypto.subtle.importKey("raw", enc.encode("WebAppData"), { name:"HMAC", hash:"SHA-256" }, false, ["sign"]);
+    const secret = await crypto.subtle.sign("HMAC", key1, enc.encode(botToken));
+    const key2 = await crypto.subtle.importKey("raw", secret, { name:"HMAC", hash:"SHA-256" }, false, ["sign"]);
+    const sig = await crypto.subtle.sign("HMAC", key2, enc.encode(check));
+    const computed = [...new Uint8Array(sig)].map(b=>b.toString(16).padStart(2,"0")).join("");
+    if (computed.length !== hash.length) return null;
+    let diff = 0; for (let i=0;i<computed.length;i++) diff |= computed.charCodeAt(i) ^ hash.charCodeAt(i);
+    if (diff !== 0) return null;
+    const rawUser = params.get("user"); return rawUser ? JSON.parse(rawUser) : null;
+  } catch { return null; }
+}
+
 async function authorizedConfig(env, channelId, userId) {
   if (!channelId) return null;
   const cfg = await getChannel(env, channelId);
@@ -356,13 +453,8 @@ async function countJoin(env, channelId) {
 async function notifyUsers(env, ids, text) {
   await Promise.all((ids || []).map(id => sendMessage(env, id, text)));
 }
-async function sendMessage(env, chatId, text) {
-  return telegram(env, "sendMessage", {
-    chat_id: chatId,
-    text,
-    parse_mode: "HTML",
-    disable_web_page_preview: true,
-  });
+async function sendMessage(env, chatId, text, extra = {}) {
+  return telegram(env, "sendMessage", { chat_id: chatId, text, parse_mode: "HTML", disable_web_page_preview: true, ...extra });
 }
 async function sendPhoto(env, chatId, photo, caption) {
   return telegram(env, "sendPhoto", {

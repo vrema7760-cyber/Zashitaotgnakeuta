@@ -3,5 +3,5 @@ main = "src/index.js"
 compatibility_date = "2026-11-01"
 
 [[kv_namespaces]]
-binding = "tgguard"
-id = "a949d6cab2474de18189acf00e4123d8"
+binding = "STATE"
+id = "6c5e2f7a3ab1484fb1f2218bd0575b4e"

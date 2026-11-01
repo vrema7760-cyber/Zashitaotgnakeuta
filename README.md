@@ -1,110 +1,74 @@
-# Zashitaotgnakeuta — Telegram anti-nakрутка bot
+# Zashitaotgnakeuta — публичный Telegram-бот для защиты каналов
 
-Cloudflare Worker + Telegram Bot API. The bot monitors channel join requests and member events, alerts administrators about unusual join bursts, and can automatically reject/ban **only accounts Telegram explicitly marks as bots**.
+Один экземпляр бота обслуживает много каналов и разных владельцев. Пользователям не нужны общий `ADMIN_IDS` или общий `CHANNEL_ID`: права проверяются отдельно для каждого канала через Telegram.
 
-## Important limitations
+## Как подключить канал
 
-- Telegram does not provide a reliable account-creation date or a universal “fake subscriber” signal.
-- The bot does not label ordinary users as bots because they lack a photo/username or arrive in a burst.
-- For best screening, enable **join requests** on channel invite links and add the bot as an administrator with permission to invite/manage users.
-- The automatic `protect` mode is intentionally conservative. Review alerts and manually assess suspicious waves of human-looking accounts.
+1. Пользователь открывает бота и нажимает Start.
+2. Добавляет бота администратором своего канала.
+3. Даёт необходимые права на управление заявками и блокировку участников.
+4. Пишет боту в личку `/channels`. Бот покажет подключённый канал и его ID.
+5. Настраивает конкретный канал командами ниже.
 
-## 1. Create a Telegram bot
+Каждый администратор может управлять только теми каналами, где Telegram подтверждает его текущие права администратора.
 
-1. Create a bot through [@BotFather](https://t.me/BotFather) and copy its token.
-2. Find your Telegram numeric user ID and put it in `ADMIN_IDS`.
-3. Add the bot as an administrator of your channel. Give it the permissions needed to manage join requests and restrict/ban members.
-4. For join-request screening, use an invite link configured to require administrator approval.
+## Переменные Cloudflare
 
-## 2. Create Cloudflare resources
+В Worker → Settings → Variables and Secrets добавьте:
 
-1. Create a Cloudflare Worker named `zashitaotgnakeuta`.
-2. Create a Workers KV namespace, for example `ZASHITA_STATE`.
-3. In Worker **Settings → Bindings**, add a KV namespace binding:
-   - Variable name: `STATE`
-   - Namespace: the namespace you created.
-4. In Worker **Settings → Variables and Secrets**, add:
-   - `BOT_TOKEN` — Telegram bot token (**Secret**)
-   - `WEBHOOK_SECRET` — random secret, 32–64 characters using letters, digits, `_` or `-` (**Secret**)
-   - `ADMIN_IDS` — comma-separated numeric Telegram user IDs, e.g. `123456789,987654321`
-   - `CHANNEL_ID` — channel ID, usually `-100...`; optional if the bot should monitor every chat where it receives updates.
+- `BOT_TOKEN` — секретный токен от @BotFather.
 
-Do not commit real tokens or secrets to GitHub.
+В Worker → Settings → Bindings добавьте KV namespace с переменной `STATE`.
 
-## 3. Deploy
+`WEBHOOK_SECRET`, `ADMIN_IDS` и `CHANNEL_ID` не нужны: бот многопользовательский и многоканальный.
 
-Install Wrangler and deploy:
+## Деплой
 
-```bash
-npm install -g wrangler
-wrangler login
-wrangler deploy
-```
+1. Создайте KV namespace в Cloudflare.
+2. Укажите его ID в `wrangler.toml` вместо `REPLACE_WITH_YOUR_KV_NAMESPACE_ID` либо настройте binding `STATE` через Dashboard.
+3. Добавьте секреты из раздела выше.
+4. Выполните `npm install -g wrangler`, `wrangler login`, `wrangler deploy`.
 
-If using this repository with Wrangler, replace the placeholder KV namespace ID in `wrangler.toml` with your actual namespace ID. Alternatively, create the KV binding in the Cloudflare dashboard.
+## Webhook
 
-Your Worker URL will look like:
+Установите webhook на адрес:
 
-```text
-https://zashitaotgnakeuta.<your-subdomain>.workers.dev
-```
+`https://<WORKER_HOST>/telegram/webhook`
 
-Webhook endpoint:
+Укажите `allowed_updates`:
 
-```text
-https://zashitaotgnakeuta.<your-subdomain>.workers.dev/telegram/webhook
-```
+`["my_chat_member","chat_join_request","chat_member","message"]`
 
-## 4. Register the Telegram webhook
+Пример запроса (подставьте токен и домен):
 
-Replace the placeholders and open this URL (or run the equivalent request):
+`https://api.telegram.org/bot<BOT_TOKEN>/setWebhook?url=https://<WORKER_HOST>/telegram/webhook&allowed_updates=%5B%22my_chat_member%22%2C%22chat_join_request%22%2C%22chat_member%22%2C%22message%22%5D`
 
-```text
-https://api.telegram.org/bot<BOT_TOKEN>/setWebhook?url=https://<WORKER_HOST>/telegram/webhook&secret_token=<WEBHOOK_SECRET>&allowed_updates=%5B%22message%22%2C%22chat_join_request%22%2C%22chat_member%22%5D
-```
+**Примечание по безопасности:** webhook без `secret_token` проще настроить, но его URL публично доступен и endpoint не проверяет заголовок Telegram. Не публикуйте токен бота; для более строгой защиты в будущем можно включить проверку webhook-секрета.
 
-Telegram should return `{"ok":true,"result":true,...}`.
+Не публикуйте URL с токеном.
 
-Check webhook status:
+## Команды в личном чате с ботом
 
-```text
-https://api.telegram.org/bot<BOT_TOKEN>/getWebhookInfo
-```
+- `/start` или `/help` — инструкция.
+- `/channels` — каналы, к которым подключён бот и где вы сейчас администратор.
+- `/status <CHANNEL_ID>` — настройки канала.
+- `/mode alerts <CHANNEL_ID>` — только уведомления.
+- `/mode protect <CHANNEL_ID>` — осторожная автоматическая защита.
+- `/threshold 12 <CHANNEL_ID>` — уведомлять при 12+ заявках за минуту.
 
-Keep the bot token private; do not paste the full webhook URL into public chats because it contains the token.
+## Что делает защита
 
-## 5. Commands
+- Считает заявки отдельно по каждому каналу и минутному интервалу.
+- Уведомляет администраторов о резком росте заявок.
+- В режиме `protect` автоматически отклоняет заявку или удаляет вступивший аккаунт **только если Telegram явно указал `is_bot: true`**.
+- Не считает человека ботом из-за отсутствия фото, username, имени или из-за быстрого вступления.
 
-Send these commands to the bot in a private chat from an ID listed in `ADMIN_IDS`:
+## Ограничения Telegram
 
-- `/start` or `/help` — help
-- `/status` — current mode and threshold
-- `/mode alerts` — notifications only (default)
-- `/mode protect` — reject join requests from accounts Telegram explicitly marks as bots; also remove such bot accounts if they join directly and Telegram reports them as bots
-- `/threshold 12` — alert when 12 or more join requests are observed in one minute
+Telegram не предоставляет достоверную дату создания аккаунта и универсальный признак фальшивого подписчика. Поэтому всплеск заявок — сигнал для проверки, а не доказательство накрутки. Для предварительной модерации используйте пригласительные ссылки с заявками на вступление.
 
-## How detection works
+## Структура
 
-- Counts incoming join requests in one-minute windows using KV.
-- Alerts admins when the configured threshold is reached.
-- Reports explicit Telegram bot accounts.
-- Does not use unreliable heuristics such as missing avatar, missing username, display name, or guessed account age.
-
-## Troubleshooting
-
-- **Bot does not receive requests:** check `getWebhookInfo`, `allowed_updates`, Worker logs, and that the bot is an administrator.
-- **Join requests are not detected:** ensure invite links require approval and that `chat_join_request` is included in webhook `allowed_updates`.
-- **Member joins are not detected:** include `chat_member` in `allowed_updates`; the bot must be an administrator.
-- **No admin alerts:** check that `ADMIN_IDS` contains your numeric Telegram user ID and that you have opened a private chat with the bot and pressed Start.
-- **401 from Worker:** make sure the webhook `secret_token` exactly matches the `WEBHOOK_SECRET` Worker secret.
-
-## Project structure
-
-```text
-.
-├── src/
-│   └── index.js
-├── wrangler.toml
-├── README.md
-└── .gitignore
-```
+- `src/index.js` — Worker.
+- `wrangler.toml` — конфигурация.
+- `README.md` — эта инструкция.

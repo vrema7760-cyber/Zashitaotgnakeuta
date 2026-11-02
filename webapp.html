@@ -42,7 +42,7 @@
         <section class="analytics-card"><div class="analytics-card-head"><div><div class="analytics-card-title">Предупреждения</div><div class="analytics-card-sub">Необычные всплески вступлений</div></div><span class="alert-mark">!</span></div><div id="analyticsAlerts" class="alert-list"></div></section>
       </div>
       <section class="analytics-card"><div class="analytics-card-head"><div><div class="analytics-card-title">Ваши каналы</div><div class="analytics-card-sub">Количество участников и свежая динамика</div></div><span class="muted-chip">Сводка</span></div><div id="channelAnalyticsList" class="channel-analytics-list"></div></section>
-      <div class="analytics-info"><strong>Как работает мониторинг:</strong> Telegram присылает изменения участников только после включения <code>chat_member</code> в <code>allowed_updates</code> webhook, когда бот — администратор канала. История до включения не восстанавливается. Всплеск — повод проверить канал, а не доказательство накрутки.</div>
+      <div class="analytics-info" id="analyticsMonitoringStatus"><strong>Проверка мониторинга:</strong> Проверяем настройки Telegram webhook…</div>
     </section>
     <section class="panel" id="settingsPanel" hidden><div class="panel-head"><div><div class="panel-title" id="settingsTitle">Настройки канала</div><div class="panel-desc">Изменения применяются к выбранному каналу</div></div><button class="icon-btn" id="closeSettings" aria-label="Закрыть настройки"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="m6 6 12 12M18 6 6 18"/></svg></button></div><div class="settings"><label class="field">Режим работы<select id="mode"><option value="alerts">🔔 Только уведомления</option><option value="protect">🛡 Автоматическая защита</option></select></label><label class="field">Порог подозрительной активности в минуту<input id="threshold" type="number" min="2" max="1000" step="1" value="12"></label></div><div class="settings-footer"><div class="save-status" id="saveStatus" role="status"></div><button class="btn primary" id="save"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M5 4h12l3 3v13H4V4h1Z"/><path d="M8 4v6h8V4M8 20v-7h8v7"/></svg>Сохранить настройки</button></div></section>
   </main>
@@ -84,17 +84,17 @@ function fmtNumber(v){return v===null||v===undefined||!Number.isFinite(Number(v)
 function fmtSigned(v){if(v===null||v===undefined||!Number.isFinite(Number(v)))return'Нет истории';const n=Number(v);return(n>0?'+':'')+n.toLocaleString('ru-RU')}
 function getPeriodRange(){return analyticsPeriod==='24h'?24*3600000:analyticsPeriod==='30d'?30*24*3600000:7*24*3600000}
 function buildSubscriberSeries(channels){
-  const start=Date.now()-getPeriodRange(),byTime=new Map();
-  for(const channel of channels){for(const point of (channel.history||[])){const ts=Math.floor(Number(point.timestamp)/3600000)*3600000;if(ts>=start-3600000&&ts<=Date.now())byTime.set(ts,true)}}
+  const now=Date.now(),start=now-getPeriodRange(),byTime=new Map();
+  for(const channel of channels){for(const point of (channel.history||[])){const ts=Number(point.timestamp);if(Number.isFinite(ts)&&ts>=start-getPeriodRange()&&ts<=now)byTime.set(ts,true)}}
   const times=[...byTime.keys()].sort((a,b)=>a-b),series=[];
-  for(const ts of times){let total=0,complete=channels.length>0;for(const channel of channels){const hist=(channel.history||[]).filter(p=>Number(p.timestamp)<=ts);const point=hist.at(-1);if(!point){complete=false;break}total+=Number(point.count)||0}if(complete&&ts>=start)series.push({timestamp:ts,count:total})}
+  for(const ts of times){let total=0,complete=channels.length>0;for(const channel of channels){const hist=(channel.history||[]).filter(p=>Number(p.timestamp)<=ts).sort((a,b)=>Number(a.timestamp)-Number(b.timestamp));const point=hist.at(-1);if(!point){complete=false;break}total+=Number(point.count)||0}if(complete&&ts>=start)series.push({timestamp:ts,count:total})}
   return series;
 }
 function renderSubscriberChart(channels){
   const series=buildSubscriberSeries(channels),chart=$('subscriberChart');
   $('chartRangeLabel').textContent=analyticsPeriod==='24h'?'За 24 часа':analyticsPeriod==='30d'?'За 30 дней':'За 7 дней';
   $('chartSubtitle').textContent=`Суммарное число участников · ${channels.length} канал(а/ов)`;
-  if(series.length<2){chart.innerHTML='<div class="analytics-empty"><strong>История только начинает собираться</strong>Для графика нужны хотя бы два часовых замера. Новые данные появятся автоматически по расписанию.</div>';return}
+  if(!series.length){chart.innerHTML='<div class="analytics-empty"><strong>Пока нет точек для графика</strong>Счётчик уже запрашивается у Telegram. График появится после первого сохранённого замера и следующего обновления.</div>';return}
   const W=860,H=230,L=46,R=18,T=18,B=34,innerW=W-L-R,innerH=H-T-B;
   const values=series.map(p=>p.count),min=Math.min(...values),max=Math.max(...values),pad=Math.max(1,(max-min)*.12),lo=min-pad,hi=max+pad;
   const x=i=>L+(series.length===1?innerW/2:i/(series.length-1)*innerW),y=v=>T+(hi-v)/(hi-lo)*innerH;
@@ -102,9 +102,23 @@ function renderSubscriberChart(channels){
   const grid=[0,1,2,3].map(i=>{const yy=T+i*innerH/3,val=hi-i*(hi-lo)/3;return `<line class="chart-grid" x1="${L}" y1="${yy}" x2="${W-R}" y2="${yy}"/><text class="chart-label" x="${L-9}" y="${yy+4}" text-anchor="end">${esc(fmtNumber(Math.round(val)))}</text>`}).join('');
   const startLabel=new Date(series[0].timestamp).toLocaleDateString('ru-RU',{day:'numeric',month:'short'}),endLabel=new Date(series.at(-1).timestamp).toLocaleDateString('ru-RU',{day:'numeric',month:'short'});
   const dots=pts.filter((_,i)=>i===pts.length-1||i===0||i%Math.max(1,Math.floor(pts.length/8))===0).map(p=>`<circle class="chart-point" cx="${p[0].toFixed(1)}" cy="${p[1].toFixed(1)}" r="3.2"/>`).join('');
-  chart.innerHTML=`<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="График динамики числа подписчиков"><defs><linearGradient id="chartFill" x1="0" x2="0" y1="0" y2="1"><stop offset="0%" stop-color="#8bb5ff" stop-opacity=".24"/><stop offset="100%" stop-color="#8bb5ff" stop-opacity="0"/></linearGradient></defs>${grid}<path class="chart-area-fill" d="${area}"/><polyline class="chart-line" points="${line}"/>${dots}<text class="chart-label" x="${L}" y="${H-8}">${esc(startLabel)}</text><text class="chart-label" x="${W-R}" y="${H-8}" text-anchor="end">${esc(endLabel)}</text></svg>`;
+  const areaMarkup=pts.length>1?`<path class="chart-area-fill" d="${area}"/>`:'';
+  const timeFormat=analyticsPeriod==='24h'?{hour:'2-digit',minute:'2-digit'}:{day:'numeric',month:'short'};
+  const chartStart=new Date(series[0].timestamp).toLocaleString('ru-RU',timeFormat),chartEnd=new Date(series.at(-1).timestamp).toLocaleString('ru-RU',timeFormat);
+  chart.innerHTML=`<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="График динамики числа подписчиков"><defs><linearGradient id="chartFill" x1="0" x2="0" y1="0" y2="1"><stop offset="0%" stop-color="#8bb5ff" stop-opacity=".24"/><stop offset="100%" stop-color="#8bb5ff" stop-opacity="0"/></linearGradient></defs>${grid}${areaMarkup}<polyline class="chart-line" points="${line}"/>${dots}<text class="chart-label" x="${L}" y="${H-8}">${esc(chartStart)}</text><text class="chart-label" x="${W-R}" y="${H-8}" text-anchor="end">${esc(chartEnd)}</text></svg>`;
 }
 function renderAnalytics(){
+  const monitoring=data.monitoring||{};
+  const monitorBox=$('analyticsMonitoringStatus');
+  if(monitoring.chatMemberEnabled===false){
+    monitorBox.innerHTML='<strong>⚠️ Telegram не присылает события вступления и выхода.</strong> В webhook не включён <code>chat_member</code>. Обновите webhook с параметром <code>allowed_updates</code>, включающим <code>chat_member</code>. После этого новые изменения начнут учитываться; прошлые события Telegram не восстановит.';
+  }else if(monitoring.chatMemberEnabled===true&&monitoring.webhookConfigured){
+    monitorBox.innerHTML='<strong>✓ События участников подключены.</strong> Бот получает изменения статуса участников. Текущий график строится по часовым снимкам и последнему актуальному счётчику.';
+  }else if(monitoring.ok===false){
+    monitorBox.innerHTML='<strong>Не удалось проверить webhook.</strong> Проверьте подключение бота к Telegram и его webhook.';
+  }else{
+    monitorBox.innerHTML='<strong>Webhook не настроен.</strong> Telegram не сможет присылать события участников, пока webhook не будет зарегистрирован.';
+  }
   const channels=Array.isArray(data.analytics)?data.analytics:[],hasCount=c=>c.currentCount!==null&&c.currentCount!==undefined&&Number.isFinite(Number(c.currentCount)),knownCounts=channels.filter(hasCount).length;
   const totalSubscribers=channels.reduce((sum,c)=>sum+(hasCount(c)?Number(c.currentCount):0),0);
   const sum=(key)=>channels.reduce((acc,c)=>acc+Number(c.stats?.[key]||0),0);
@@ -123,7 +137,7 @@ function renderAnalytics(){
 async function loadAnalytics(force=false){
   if(analyticsLoading)return; if(analyticsLoaded&&!force){renderAnalytics();return}
   analyticsLoading=true;$('subscriberChart').innerHTML='<div class="analytics-empty">Получаем свежие данные и историю канала…</div>';
-  try{const result=await api('/api/analytics');data.analytics=Array.isArray(result.analytics)?result.analytics:[];analyticsLoaded=true;$('updatedAt').textContent='● Аналитика обновлена '+new Date().toLocaleTimeString('ru-RU',{hour:'2-digit',minute:'2-digit'});render();if(force)showToast('Аналитика подписчиков обновлена')}
+  try{const result=await api('/api/analytics');data.analytics=Array.isArray(result.analytics)?result.analytics:[];data.monitoring=result.monitoring||{};analyticsLoaded=true;$('updatedAt').textContent='● Аналитика обновлена '+new Date().toLocaleTimeString('ru-RU',{hour:'2-digit',minute:'2-digit'});render();if(force)showToast('Аналитика подписчиков обновлена')}
   catch(e){$('subscriberChart').innerHTML=`<div class="analytics-empty"><strong>Не удалось загрузить аналитику</strong>${esc(e.message)}</div>`;showToast(e.message)}finally{analyticsLoading=false}
 }
 

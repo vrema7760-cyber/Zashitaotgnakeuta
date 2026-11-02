@@ -192,9 +192,18 @@ async function recordSubscriberTransition(env, cfg, user, type) {
   // per hour as member events arrive. The dashboard can also force a fresh count.
   const snapshotKey = `analytics:snapshot:${channelId}:${timestampKey(hourStart)}`;
   if (!(await env.STATE.get(snapshotKey))) {
-    await refreshChannelSubscriberSnapshot(env, cfg).catch(error => {
+    const snapshot = await refreshChannelSubscriberSnapshot(env, cfg).catch(error => {
       console.error(`Subscriber snapshot failed for ${channelId}:`, error?.message || error);
+      return null;
     });
+    if (snapshot) {
+      // This may be the first-ever sample and is taken after the current event.
+      // Reverse the transitions seen in this hour to store the real hour baseline.
+      const startCount = Math.max(0, Number(snapshot.count) - Number(hourRecord.joins || 0) + Number(hourRecord.leaves || 0));
+      await env.STATE.put(snapshotKey, JSON.stringify({
+        ...snapshot, count: startCount, timestamp: hourStart, bucketStart: hourStart,
+      }), { expirationTtl: 60 * 60 * 24 * 60 });
+    }
   }
 
   const threshold = Math.max(2, Number(cfg.threshold) || DEFAULT_THRESHOLD);
@@ -237,11 +246,18 @@ async function saveSubscriberSnapshot(env, channelId, count, timestamp = Date.no
   const id = String(channelId);
   const bucketStart = Math.floor(timestamp / 3600000) * 3600000;
   const record = { channelId: id, count: Number(count), timestamp, bucketStart };
-  await env.STATE.put(
-    `analytics:snapshot:${id}:${timestampKey(bucketStart)}`,
-    JSON.stringify(record),
-    { expirationTtl: 60 * 60 * 24 * 60 },
-  );
+  const bucketKey = `analytics:snapshot:${id}:${timestampKey(bucketStart)}`;
+  const ttl = { expirationTtl: 60 * 60 * 24 * 60 };
+
+  // Keep the first count seen in each hour as the baseline. Overwriting this
+  // value on every dashboard refresh erased the before/after change and made
+  // a chart impossible to draw during the first hour after setup.
+  if (!(await env.STATE.get(bucketKey))) {
+    await env.STATE.put(bucketKey, JSON.stringify(record), ttl);
+  }
+  // The latest sample is separate from the hourly baseline and is returned
+  // to the API for a live chart endpoint.
+  await env.STATE.put(`analytics:current:${id}`, JSON.stringify(record), ttl);
   return record;
 }
 
@@ -305,10 +321,9 @@ async function getChannelAnalytics(env, channel, refreshCurrent = true) {
     if (!Number.isFinite(Number(item.bucketStart)) || Number(item.bucketStart) < cutoff30d) continue;
     snapshotByBucket.set(String(item.bucketStart), item);
   }
-  if (freshSnapshot) snapshotByBucket.set(String(freshSnapshot.bucketStart), freshSnapshot);
   const history = [...snapshotByBucket.values()]
     .filter(item => Number.isFinite(Number(item.count)))
-    .sort((a, b) => Number(a.timestamp) - Number(b.timestamp))
+    .sort((a, b) => Number(a.bucketStart || a.timestamp) - Number(b.bucketStart || b.timestamp))
     .map(item => ({ timestamp: Number(item.bucketStart || Math.floor(Number(item.timestamp) / 3600000) * 3600000), count: Number(item.count) }));
   const hourly = hourlyRaw
     .filter(item => Number(item.timestamp) >= cutoff30d)
@@ -330,6 +345,22 @@ async function getChannelAnalytics(env, channel, refreshCurrent = true) {
   const sumSince = (field, days) => hourly.reduce((sum, item) =>
     sum + (item.timestamp >= now - days * 24 * 60 * 60 * 1000 ? Number(item[field] || 0) : 0), 0);
   const currentCount = freshSnapshot?.count ?? history.at(-1)?.count ?? null;
+  if (freshSnapshot && currentCount !== null) {
+    const currentBucket = Math.floor(Number(freshSnapshot.timestamp) / 3600000) * 3600000;
+    const currentHour = hourly.find(item => item.timestamp === currentBucket);
+    const baselineIndex = history.findIndex(item => item.timestamp === currentBucket);
+    // If the first snapshot was taken only after the first member event, infer
+    // the start-of-hour count from the exact join/leave counters.
+    if (currentHour && (currentHour.joins || currentHour.leaves)) {
+      const inferredStart = Math.max(0, Number(currentCount) - currentHour.joins + currentHour.leaves);
+      if (baselineIndex >= 0) history[baselineIndex].count = inferredStart;
+      else history.push({ timestamp: currentBucket, count: inferredStart });
+    }
+    // Add a live point, not just the hourly bucket. This lets a newly enabled
+    // monitor show a visible change immediately instead of waiting one hour.
+    history.push({ timestamp: Math.max(Number(freshSnapshot.timestamp), currentBucket + 1), count: Number(currentCount) });
+    history.sort((a, b) => a.timestamp - b.timestamp);
+  }
   const baseline = history.filter(item => item.timestamp <= now - 24 * 60 * 60 * 1000).at(-1);
   return {
     channelId: id,
@@ -574,8 +605,11 @@ async function handleApi(request, env, url) {
   const userId = String(user.id);
   if (request.method === "GET" && url.pathname === "/api/analytics") {
     const channels = await listUserChannels(env, userId);
-    const analytics = await Promise.all(channels.map(channel => getChannelAnalytics(env, channel, true)));
-    return json({ analytics, generatedAt: new Date().toISOString() });
+    const [analytics, monitoring] = await Promise.all([
+      Promise.all(channels.map(channel => getChannelAnalytics(env, channel, true))),
+      getWebhookDiagnostics(env),
+    ]);
+    return json({ analytics, monitoring, generatedAt: new Date().toISOString() });
   }
   if (request.method === "GET" && url.pathname === "/api/bootstrap") {
     const channels = await listUserChannels(env, userId), ids = new Set(channels.map(c => String(c.id)));
@@ -603,6 +637,29 @@ async function handleApi(request, env, url) {
     return json({ ok: true, channel: cfg });
   }
   return json({ error: "Not found" }, 404);
+}
+
+async function getWebhookDiagnostics(env) {
+  try {
+    const response = await telegram(env, "getWebhookInfo", {});
+    if (!response.ok || !response.result) {
+      return { ok: false, chatMemberEnabled: null, message: "Не удалось проверить настройки webhook Telegram." };
+    }
+    const info = response.result;
+    const allowed = Array.isArray(info.allowed_updates) ? info.allowed_updates : [];
+    return {
+      ok: true,
+      webhookConfigured: Boolean(info.url),
+      chatMemberEnabled: allowed.includes("chat_member"),
+      allowedUpdates: allowed,
+      pendingUpdateCount: Number(info.pending_update_count || 0),
+      lastErrorMessage: info.last_error_message || null,
+      lastErrorDate: info.last_error_date ? Number(info.last_error_date) * 1000 : null,
+    };
+  } catch (error) {
+    console.error("Webhook diagnostics failed:", error?.message || error);
+    return { ok: false, chatMemberEnabled: null, message: "Не удалось проверить настройки webhook Telegram." };
+  }
 }
 
 async function validateTelegramInitData(initData, botToken) {

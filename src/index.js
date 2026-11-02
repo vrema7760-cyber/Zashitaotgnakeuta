@@ -3,6 +3,17 @@ import { WEBAPP_HTML } from "./webapp.js";
 
 const DEFAULT_THRESHOLD = 12;
 const DEFAULT_MODE = "alerts";
+const DEFAULT_MODERATION = Object.freeze({
+  antiSpam: false,
+  antiProfanity: false,
+  antiLinks: false,
+  antiRaid: false,
+  profanityMuteMinutes: 30,
+  spamMuteMinutes: 5,
+  raidThreshold: DEFAULT_THRESHOLD,
+  profanityWords: ["бля", "бляд", "сука", "хуй", "хуе", "хуё", "пизд", "еба", "ебл", "ёб", "мудак", "гандон", "шлюх", "залуп"],
+});
+const MAX_LOG_ITEMS = 100;
 
 export default {
   async scheduled(controller, env, ctx) {
@@ -44,7 +55,13 @@ async function handleUpdate(update, env, publicOrigin = "") {
     if (update.my_chat_member) await handleBotMembership(update.my_chat_member, env);
     if (update.chat_join_request) await handleJoinRequest(update.chat_join_request, env);
     if (update.chat_member) await handleChatMember(update.chat_member, env);
-    if (update.message) await handlePrivateMessage(update.message, env, publicOrigin);
+    if (update.message) {
+      if (update.message.chat?.type === "private") await handlePrivateMessage(update.message, env, publicOrigin);
+      else if (["group", "supergroup"].includes(update.message.chat?.type)) {
+        await handleModerationMessage(update.message, env);
+      }
+    }
+    if (update.channel_post) await handleChannelPostModeration(update.channel_post, env);
     if (update.callback_query) await handleCallbackQuery(update.callback_query, env, publicOrigin);
   } catch (error) {
     console.error("Update failed:", error?.stack || error);
@@ -55,21 +72,23 @@ async function handleBotMembership(update, env) {
   const chat = update.chat;
   const oldStatus = update.old_chat_member?.status;
   const newStatus = update.new_chat_member?.status;
-  if (chat?.type !== "channel") return;
+  if (!["channel", "group", "supergroup"].includes(chat?.type)) return;
 
   if (["administrator", "creator"].includes(newStatus)) {
     const adminsResponse = await telegram(env, "getChatAdministrators", { chat_id: chat.id });
     const adminIds = Array.isArray(adminsResponse.result)
-      ? adminsResponse.result.map(item => String(item.user.id))
+      ? adminsResponse.result.filter(item => item.user?.is_bot !== true).map(item => String(item.user.id))
       : [];
     const previous = await getChannel(env, chat.id);
     const cfg = {
       id: String(chat.id),
       title: chat.title || String(chat.id),
       username: chat.username || "",
+      chatType: chat.type,
       admins: adminIds,
       mode: previous?.mode || DEFAULT_MODE,
       threshold: previous?.threshold || DEFAULT_THRESHOLD,
+      moderation: normalizeModeration(previous?.moderation),
       enabled: true,
     };
     await env.STATE.put(channelKey(chat.id), JSON.stringify(cfg));
@@ -77,8 +96,8 @@ async function handleBotMembership(update, env) {
       console.error("Initial subscriber snapshot failed:", error?.stack || error);
     });
     await notifyUsers(env, adminIds,
-      `🛡 Бот подключён к каналу <b>${escapeHtml(cfg.title)}</b>.\n` +
-      `Настройки: /channels. Режим по умолчанию — уведомления.`);
+      `🛡 TG Guard подключён к ${chat.type === "channel" ? "каналу" : "группе"} <b>${escapeHtml(cfg.title)}</b>.\n` +
+      `Настройки: /channels. Модерация сообщений выключена до настройки в Web App.`);
   } else if (["administrator", "creator"].includes(oldStatus)) {
     await env.STATE.delete(channelKey(chat.id));
   }
@@ -126,6 +145,11 @@ async function handleChatMember(update, env) {
   const left = wasMember && !isMember;
 
   if (joined || left) {
+    if (joined && ["group", "supergroup"].includes(update.chat?.type)) {
+      await env.STATE.put(joinedAtKey(update.chat.id, user.id), String(Date.now()), { expirationTtl: 60 * 60 * 24 });
+    } else if (left) {
+      await env.STATE.delete(joinedAtKey(update.chat.id, user.id));
+    }
     await recordSubscriberTransition(env, cfg, user, joined ? "join" : "leave");
   }
 
@@ -206,8 +230,24 @@ async function recordSubscriberTransition(env, cfg, user, type) {
     }
   }
 
-  const threshold = Math.max(2, Number(cfg.threshold) || DEFAULT_THRESHOLD);
+  const moderationSettings = normalizeModeration(cfg.moderation);
+  const standardThreshold = Math.max(2, Number(cfg.threshold) || DEFAULT_THRESHOLD);
+  const threshold = moderationSettings.antiRaid && ["group", "supergroup"].includes(cfg.chatType)
+    ? Math.min(standardThreshold, Math.max(2, moderationSettings.raidThreshold)) : standardThreshold;
   if (type !== "join" || Number(minuteRecord.joins) < threshold) return;
+  const moderation = normalizeModeration(cfg.moderation);
+  const shouldActivateRaid = moderation.antiRaid && ["group", "supergroup"].includes(cfg.chatType) &&
+    Number(minuteRecord.joins) >= Math.max(2, moderation.raidThreshold);
+  if (shouldActivateRaid) {
+    const activeUntil = Number(await env.STATE.get(raidKey(channelId)) || 0);
+    if (activeUntil <= now) {
+      const raidUntil = now + 5 * 60 * 1000;
+      await env.STATE.put(raidKey(channelId), String(raidUntil), { expirationTtl: 5 * 60 });
+      await writeModerationLog(env, cfg.id, { type: "anti_raid", userId: "", userName: "",
+        reason: `Всплеск вступлений: ${minuteRecord.joins} за минуту`, action: "raid_mode", timestamp: now, durationMinutes: 5 });
+      await notifyUsers(env, cfg.admins, `🛡 <b>Анти-рейд включён</b> в чате <b>${escapeHtml(cfg.title)}</b> на 5 минут.\nВступлений за минуту: ${minuteRecord.joins}. Сообщения недавно вступивших участников будут удаляться. Капчи нет.`);
+    }
+  }
   const alertKey = `analytics:alert:${channelId}:${timestampKey(minuteStart)}`;
   const existingAlert = await env.STATE.get(alertKey, "json");
   if (existingAlert) {
@@ -232,8 +272,8 @@ async function recordSubscriberTransition(env, cfg, user, type) {
   };
   await env.STATE.put(alertKey, JSON.stringify(alert), { expirationTtl: 60 * 60 * 24 * 60 });
   await notifyUsers(env, cfg.admins,
-    `⚠️ <b>Подозрительный всплеск подписок</b>\n` +
-    `Канал: <b>${escapeHtml(cfg.title)}</b>\n` +
+    `⚠️ <b>Подозрительный всплеск вступлений</b>\n` +
+    `Чат: <b>${escapeHtml(cfg.title)}</b>\n` +
     `За одну минуту зафиксировано не менее ${alert.joins} новых участников (порог: ${threshold}).\n` +
     `Это сигнал для проверки, а не автоматическое доказательство накрутки.`);
 }
@@ -425,6 +465,208 @@ async function recordBot(env, user, cfg, action) {
   await env.STATE.put(key, JSON.stringify(record));
 }
 
+function normalizeModeration(value) {
+  const source = value && typeof value === "object" ? value : {};
+  const defaults = DEFAULT_MODERATION;
+  const words = Array.isArray(source.profanityWords) ? source.profanityWords : defaults.profanityWords;
+  return {
+    antiSpam: source.antiSpam === true,
+    antiProfanity: source.antiProfanity === true,
+    antiLinks: source.antiLinks === true,
+    antiRaid: source.antiRaid === true,
+    profanityMuteMinutes: clampInteger(source.profanityMuteMinutes, 30, 1, 10080),
+    spamMuteMinutes: clampInteger(source.spamMuteMinutes, 5, 1, 1440),
+    raidThreshold: clampInteger(source.raidThreshold, DEFAULT_THRESHOLD, 2, 1000),
+    profanityWords: [...new Set(words.map(word => String(word).trim().slice(0, 50)).filter(Boolean))].slice(0, 200),
+  };
+}
+function clampInteger(value, fallback, min, max) {
+  const n = Number(value);
+  return Number.isInteger(n) && n >= min && n <= max ? n : fallback;
+}
+function joinedAtKey(chatId, userId) { return `member-joined:${String(chatId)}:${String(userId)}`; }
+function raidKey(chatId) { return `raid:${String(chatId)}`; }
+function modLogPrefix(chatId) { return `modlog:${String(chatId)}:`; }
+function warningPrefix(chatId) { return `warning:${String(chatId)}:`; }
+function warningKey(chatId, userId) { return `${warningPrefix(chatId)}${String(userId)}`; }
+async function writeModerationLog(env, chatId, event) {
+  const timestamp = Number(event.timestamp || Date.now());
+  const suffix = `${String(timestamp).padStart(13, "0")}:${crypto.randomUUID?.() || Math.random().toString(36).slice(2)}`;
+  const record = { chatId: String(chatId), timestamp, ...event };
+  await env.STATE.put(`${modLogPrefix(chatId)}${suffix}`, JSON.stringify(record), { expirationTtl: 60 * 60 * 24 * 90 });
+}
+async function addWarning(env, chatId, userId, reason, byUserId = "system", type = "warning") {
+  const key = warningKey(chatId, userId);
+  const existing = await env.STATE.get(key, "json") || { chatId: String(chatId), userId: String(userId), count: 0, history: [] };
+  const item = { reason: String(reason).slice(0, 300), byUserId: String(byUserId), timestamp: Date.now(), type };
+  existing.count = Math.max(0, Number(existing.count) || 0) + 1;
+  existing.updatedAt = item.timestamp;
+  existing.history = [...(Array.isArray(existing.history) ? existing.history : []), item].slice(-20);
+  await env.STATE.put(key, JSON.stringify(existing), { expirationTtl: 60 * 60 * 24 * 180 });
+  return existing;
+}
+async function isChatAdmin(env, chatId, userId, cfg) {
+  if ((cfg.admins || []).includes(String(userId))) return true;
+  const key = `admin-cache:${chatId}:${userId}`;
+  const cached = await env.STATE.get(key);
+  if (cached === "yes") return true;
+  if (cached === "no") return false;
+  const result = await telegram(env, "getChatMember", { chat_id: chatId, user_id: userId });
+  const admin = result.ok && ["administrator", "creator"].includes(result.result?.status);
+  await env.STATE.put(key, admin ? "yes" : "no", { expirationTtl: 60 });
+  return admin;
+}
+function normalizeForFilter(value) {
+  return String(value || "").toLocaleLowerCase("ru-RU")
+    .normalize("NFKC")
+    .replace(/[ё]/g, "е")
+    .replace(/[aа@]/g, "а").replace(/[eе3]/g, "е")
+    .replace(/[oо0]/g, "о").replace(/[pр]/g, "р").replace(/[cс]/g, "с")
+    .replace(/[xх]/g, "х").replace(/[yу]/g, "у").replace(/[kк]/g, "к")
+    .replace(/[mм]/g, "м").replace(/[tт]/g, "т").replace(/[bв]/g, "в")
+    .replace(/[^\p{L}\p{N}\s]/gu, " ")
+    .replace(/[\u200B-\u200D\uFEFF]/g, " ")
+    .replace(/\s+/g, " ").trim();
+}
+function containsProfanity(text, configuredWords) {
+  const normalized = normalizeForFilter(text);
+  if (!normalized) return false;
+  const tokens = normalized.split(/\s+/).map(token => token.replace(/\d/g, ch => ({ "0":"о", "1":"и", "3":"з", "4":"ч", "5":"с", "6":"б", "7":"т", "8":"в" }[ch] || ch)));
+  const compact = tokens.join(" ");
+  for (const raw of configuredWords || []) {
+    const word = normalizeForFilter(raw).replace(/\s+/g, "");
+    if (word.length < 3) continue;
+    const escaped = word.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const pattern = new RegExp(`(?:^|[^\\p{L}\\p{N}])${escaped}[\\p{L}]*?(?=$|[^\\p{L}\\p{N}])`, "u");
+    if (pattern.test(compact)) return true;
+    if (tokens.some(token => token.includes(word) && token.length <= word.length + 6)) return true;
+  }
+  return false;
+}
+function hasLink(text, entities = []) {
+  return /(?:https?:\/\/|www\.|t\.me\/|telegram\.me\/|(?:^|\s)@[a-z0-9_]{5,})/i.test(String(text || "")) ||
+    (Array.isArray(entities) && entities.some(entity => ["url", "text_link"].includes(entity.type)));
+}
+async function handleChannelPostModeration(message, env) {
+  // Channel posts can be removed for prohibited content/links, but muting subscribers is not available in channels.
+  const cfg = await getChannel(env, message.chat?.id);
+  if (!cfg?.enabled || message.chat?.type !== "channel") return;
+  const moderation = normalizeModeration(cfg.moderation);
+  const text = message.text || message.caption || "";
+  if (!text) return;
+  let reason = "";
+  if (moderation.antiProfanity && containsProfanity(text, moderation.profanityWords)) reason = "Ненормативная лексика в публикации";
+  else if (moderation.antiLinks && hasLink(text, message.entities || message.caption_entities)) reason = "Ссылка запрещена настройками";
+  if (!reason) return;
+  const deleted = await telegram(env, "deleteMessage", { chat_id: message.chat.id, message_id: message.message_id });
+  await writeModerationLog(env, cfg.id, { type: reason.includes("лексика") ? "profanity" : "link", userId: "", userName: "Публикация канала", reason,
+    action: deleted.ok ? "deleted" : "delete_failed", timestamp: Date.now(), messageId: message.message_id });
+  if (!deleted.ok) await notifyUsers(env, cfg.admins, `⚠️ TG Guard не смог удалить публикацию в <b>${escapeHtml(cfg.title)}</b>: ${escapeHtml(reason)}. Проверьте права бота.`);
+}
+async function registerGroupFromCommand(message, env) {
+  const chat = message.chat;
+  const adminCheck = await telegram(env, "getChatMember", { chat_id: chat.id, user_id: message.from.id });
+  if (!adminCheck.ok || !["administrator", "creator"].includes(adminCheck.result?.status)) {
+    return sendMessage(env, chat.id, "⛔ Команду /setup может выполнить только администратор группы.");
+  }
+  const botId = Number(String(env.BOT_TOKEN || "").split(":")[0]);
+  if (!Number.isSafeInteger(botId) || botId <= 0) return sendMessage(env, chat.id, "Не удалось определить ID бота из конфигурации.");
+  const botCheck = await telegram(env, "getChatMember", { chat_id: chat.id, user_id: botId });
+  if (!botCheck.ok || !["administrator", "creator"].includes(botCheck.result?.status)) {
+    return sendMessage(env, chat.id, "Сначала назначьте TG Guard администратором группы. Для автомута ему нужно право ограничивать участников, для очистки — удалять сообщения.");
+  }
+  const adminsResponse = await telegram(env, "getChatAdministrators", { chat_id: chat.id });
+  const admins = Array.isArray(adminsResponse.result)
+    ? adminsResponse.result.filter(item => item.user?.is_bot !== true).map(item => String(item.user.id))
+    : [String(message.from.id)];
+  if (!admins.includes(String(message.from.id))) admins.push(String(message.from.id));
+  const previous = await getChannel(env, chat.id);
+  const cfg = {
+    id: String(chat.id), title: chat.title || String(chat.id), username: chat.username || "",
+    chatType: chat.type, admins, mode: previous?.mode || DEFAULT_MODE,
+    threshold: previous?.threshold || DEFAULT_THRESHOLD, moderation: normalizeModeration(previous?.moderation), enabled: true,
+  };
+  await env.STATE.put(channelKey(chat.id), JSON.stringify(cfg));
+  await sendMessage(env, chat.id, `🛡 <b>TG Guard подключён к группе «${escapeHtml(cfg.title)}».</b>\nНастройте антиспам, антимат и анти-рейд в Web App. Все фильтры выключены до включения администратором; капчи нет.`);
+  await notifyUsers(env, admins, `✅ Группа <b>${escapeHtml(cfg.title)}</b> подключена к TG Guard. Откройте личный чат с ботом и панель управления для настройки модерации.`);
+}
+
+async function handleModerationMessage(message, env) {
+  const chat = message.chat;
+  if (!chat?.id || !["group", "supergroup"].includes(chat.type) || !message.from || message.from.is_bot) return;
+  const text = message.text || message.caption || "";
+  if (!text) return;
+  if (/^\/setup(?:@\w+)?(?:\s|$)/i.test(text.trim())) {
+    await registerGroupFromCommand(message, env);
+    return;
+  }
+  const cfg = await getChannel(env, chat.id);
+  if (!cfg?.enabled || text.startsWith("/")) return;
+  const moderation = normalizeModeration(cfg.moderation);
+  if (!moderation.antiSpam && !moderation.antiProfanity && !moderation.antiLinks && !moderation.antiRaid) return;
+  if (await isChatAdmin(env, chat.id, message.from.id, cfg)) return;
+
+  const now = Date.now();
+  const activeRaidUntil = Number(await env.STATE.get(raidKey(chat.id)) || 0);
+  const joinedAt = Number(await env.STATE.get(joinedAtKey(chat.id, message.from.id)) || 0);
+  if (moderation.antiRaid && activeRaidUntil > now && joinedAt && now - joinedAt < 10 * 60 * 1000) {
+    const deleted = await telegram(env, "deleteMessage", { chat_id: chat.id, message_id: message.message_id });
+    await writeModerationLog(env, chat.id, { type: "anti_raid", userId: String(message.from.id), userName: userLabel(message.from),
+      reason: "Сообщение новичка во время режима анти-рейда", action: deleted.ok ? "deleted" : "delete_failed", timestamp: now,
+      messageId: message.message_id, durationMinutes: Math.max(1, Math.ceil((activeRaidUntil - now) / 60000)) });
+    return;
+  }
+
+  let violation = "", type = "", muteMinutes = 0;
+  if (moderation.antiProfanity && containsProfanity(text, moderation.profanityWords)) {
+    violation = "Ненормативная лексика"; type = "profanity"; muteMinutes = moderation.profanityMuteMinutes;
+  } else if (moderation.antiLinks && hasLink(text, message.entities || message.caption_entities)) {
+    violation = "Запрещённые ссылки"; type = "link"; muteMinutes = moderation.spamMuteMinutes;
+  }
+
+  const spamKey = `spam:${chat.id}:${message.from.id}`;
+  if (!violation && moderation.antiSpam) {
+    const normalizedText = normalizeForFilter(text).slice(0, 500);
+    const history = await env.STATE.get(spamKey, "json") || { windowStart: now, count: 0, lastText: "", repeats: 0 };
+    if (now - Number(history.windowStart || now) > 10_000) {
+      history.windowStart = now; history.count = 0; history.repeats = 0;
+    }
+    history.count = Number(history.count || 0) + 1;
+    history.repeats = normalizedText && normalizedText === history.lastText ? Number(history.repeats || 0) + 1 : 0;
+    history.lastText = normalizedText;
+    await env.STATE.put(spamKey, JSON.stringify(history), { expirationTtl: 60 });
+    if (history.count >= 8 || history.repeats >= 2) {
+      violation = history.repeats >= 2 ? "Повторяющиеся сообщения" : "Флуд"; type = "spam"; muteMinutes = moderation.spamMuteMinutes;
+    }
+  }
+  if (!violation) return;
+
+  const warning = await addWarning(env, chat.id, message.from.id, violation, "system", type);
+  const escalatedMinutes = Math.min(10080, muteMinutes * Math.min(4, Math.max(1, Number(warning.count) || 1)));
+  const deleted = await telegram(env, "deleteMessage", { chat_id: chat.id, message_id: message.message_id });
+  let muted = false, muteError = "";
+  if (escalatedMinutes > 0) {
+    const until = Math.floor(now / 1000) + escalatedMinutes * 60;
+    const result = await telegram(env, "restrictChatMember", {
+      chat_id: chat.id, user_id: message.from.id, until_date: until,
+      permissions: { can_send_messages: false, can_send_audios: false, can_send_documents: false,
+        can_send_photos: false, can_send_videos: false, can_send_video_notes: false,
+        can_send_voice_notes: false, can_send_polls: false, can_send_other_messages: false,
+        can_add_web_page_previews: false, can_react_to_messages: false },
+      use_independent_chat_permissions: true,
+    });
+    muted = result.ok === true;
+    if (!muted) muteError = String(result.description || "Не удалось применить мут");
+  }
+  const action = `${deleted.ok ? "сообщение удалено" : "ошибка удаления"}; ${muted ? `мут ${escalatedMinutes} мин.` : `мут не применён (${muteError || "не настроен"})`}`;
+  await writeModerationLog(env, chat.id, { type, userId: String(message.from.id), userName: userLabel(message.from), reason: violation,
+    action, timestamp: now, messageId: message.message_id, warningCount: warning.count, durationMinutes: muted ? escalatedMinutes : 0,
+    deleteSucceeded: deleted.ok, muteSucceeded: muted });
+  if (!deleted.ok || !muted) {
+    await notifyUsers(env, cfg.admins, `⚠️ TG Guard: ${escapeHtml(violation.toLowerCase())} в <b>${escapeHtml(cfg.title)}</b> от ${userLabel(message.from)}.\\n${escapeHtml(action)}. Проверьте права администратора бота.`);
+  }
+}
+
 async function handlePrivateMessage(message, env, publicOrigin = "") {
   if (!message.text || message.chat?.type !== "private") return;
   const userId = String(message.from?.id || "");
@@ -603,6 +845,35 @@ async function handleApi(request, env, url) {
   const user = await validateTelegramInitData(request.headers.get("X-Telegram-Init-Data") || "", env.BOT_TOKEN);
   if (!user) return json({ error: "Unauthorized Telegram WebApp session" }, 401);
   const userId = String(user.id);
+  if (request.method === "GET" && url.pathname === "/api/moderation") {
+    const channelId = String(url.searchParams.get("channelId") || "");
+    const cfg = await authorizedConfig(env, channelId, userId);
+    if (!cfg) return json({ error: "Forbidden" }, 403);
+    const [events, warnings] = await Promise.all([
+      readJsonPrefix(env, modLogPrefix(channelId)),
+      readJsonPrefix(env, warningPrefix(channelId)),
+    ]);
+    events.sort((a, b) => Number(b.timestamp || 0) - Number(a.timestamp || 0));
+    warnings.sort((a, b) => Number(b.count || 0) - Number(a.count || 0));
+    return json({ channelId, title: cfg.title, moderation: normalizeModeration(cfg.moderation),
+      events: events.slice(0, MAX_LOG_ITEMS), warnings: warnings.slice(0, 100) });
+  }
+  if (request.method === "POST" && url.pathname === "/api/moderation/warn") {
+    let body; try { body = await request.json(); } catch { return json({ error: "Invalid JSON" }, 400); }
+    const cfg = await authorizedConfig(env, String(body.channelId || ""), userId);
+    if (!cfg) return json({ error: "Forbidden" }, 403);
+    const targetId = String(body.userId || "").trim();
+    const reason = String(body.reason || "Нарушение правил").trim().slice(0, 300);
+    if (!/^\d{1,20}$/.test(targetId)) return json({ error: "Укажите числовой Telegram ID пользователя" }, 400);
+    const warning = await addWarning(env, cfg.id, targetId, reason, userId, "manual_warning");
+    await writeModerationLog(env, cfg.id, { type: "warning", userId: targetId, userName: "", reason,
+      action: "warning", timestamp: Date.now(), byUserId: userId, warningCount: warning.count });
+    await notifyUsers(env, cfg.admins, `⚠️ Выдано предупреждение участнику <code>${escapeHtml(targetId)}</code> в чате <b>${escapeHtml(cfg.title)}</b>.\nПричина: ${escapeHtml(reason)}\nВсего предупреждений: ${warning.count}`);
+    if (["group", "supergroup"].includes(cfg.chatType)) {
+      await sendMessage(env, cfg.id, `⚠️ <b>Предупреждение участнику</b> <code>${escapeHtml(targetId)}</code>\nПричина: ${escapeHtml(reason)}\nВсего предупреждений: ${warning.count}`);
+    }
+    return json({ ok: true, warning });
+  }
   if (request.method === "GET" && url.pathname === "/api/analytics") {
     const channels = await listUserChannels(env, userId);
     const [analytics, monitoring] = await Promise.all([
@@ -618,7 +889,8 @@ async function handleApi(request, env, url) {
       languageCode: r.languageCode || "", firstSeenAt: r.firstSeenAt || null, lastSeenAt: r.lastSeenAt || null,
       channels: Object.entries(r.channels || {}).filter(([id]) => ids.has(id)).map(([,v]) => v)
     }));
-    return json({ user: { id: user.id, first_name: user.first_name, username: user.username }, channels, bots });
+    return json({ user: { id: user.id, first_name: user.first_name, username: user.username },
+      channels: channels.map(cfg => ({ ...cfg, chatType: cfg.chatType || "channel", moderation: normalizeModeration(cfg.moderation) })), bots });
   }
   if (request.method === "POST" && url.pathname === "/api/settings") {
     let body; try { body = await request.json(); } catch { return json({ error: "Invalid JSON" }, 400); }
@@ -633,6 +905,29 @@ async function handleApi(request, env, url) {
       if (!Number.isInteger(n) || n < 2 || n > 1000) return json({ error: "Порог должен быть от 2 до 1000" }, 400);
       cfg.threshold = n;
     }
+    const moderation = normalizeModeration(cfg.moderation);
+    for (const key of ["antiSpam", "antiProfanity", "antiLinks", "antiRaid"]) {
+      if (body[key] !== undefined) {
+        if (typeof body[key] !== "boolean") return json({ error: `Параметр ${key} должен быть логическим` }, 400);
+        moderation[key] = body[key];
+      }
+    }
+    for (const [key, min, max, label] of [
+      ["profanityMuteMinutes", 1, 10080, "Длительность мута за мат"],
+      ["spamMuteMinutes", 1, 1440, "Длительность мута за спам"],
+      ["raidThreshold", 2, 1000, "Порог анти-рейда"],
+    ]) {
+      if (body[key] !== undefined) {
+        const value = Number(body[key]);
+        if (!Number.isInteger(value) || value < min || value > max) return json({ error: `${label}: допустимо от ${min} до ${max}` }, 400);
+        moderation[key] = value;
+      }
+    }
+    if (body.profanityWords !== undefined) {
+      if (!Array.isArray(body.profanityWords) || body.profanityWords.length > 200) return json({ error: "Список запрещённых слов должен быть массивом до 200 элементов" }, 400);
+      moderation.profanityWords = [...new Set(body.profanityWords.map(value => String(value).trim().slice(0, 50)).filter(Boolean))].slice(0, 200);
+    }
+    cfg.moderation = moderation;
     await env.STATE.put(channelKey(cfg.id), JSON.stringify(cfg));
     return json({ ok: true, channel: cfg });
   }

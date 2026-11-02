@@ -87,7 +87,40 @@ try {
   assert(sent.some(item => item.method === 'restrictChatMember' && item.payload.chat_id === -100500), 'profanity mute was not applied');
   assert(memory.has('warning:-100500:456'), 'automatic warning was not persisted');
   assert([...memory.keys()].some(key => key.startsWith('modlog:-100500:')), 'moderation log was not persisted');
-  console.log('PASS: profanity moderation deletes the message, mutes the user, and records warning/history.');
+
+  // Expanded dictionary should catch common roots even when punctuation/spaces/digits are used.
+  const obfuscatedCases = [
+    { id: 23, text: 'х.у.й' },
+    { id: 24, text: 'п и з д е ц' },
+    { id: 25, text: 'е6ать' },
+  ];
+  for (const testCase of obfuscatedCases) {
+    const before = sent.filter(item => item.method === 'deleteMessage').length;
+    const result = await worker.fetch(new Request('https://example.workers.dev/telegram/webhook', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ update_id: testCase.id, message: {
+        message_id: testCase.id, chat: { id: -100500, type: 'supergroup', title: 'Тестовая группа' },
+        from: { id: 456, first_name: 'Тест', is_bot: false }, text: testCase.text,
+      } }),
+    }), env, ctx);
+    assert(result.status === 200, `obfuscated profanity webhook failed for ${testCase.text}`);
+    await ctx.promise;
+    assert(sent.filter(item => item.method === 'deleteMessage').length === before + 1,
+      `obfuscated profanity was not caught: ${testCase.text}`);
+  }
+  const safeBefore = sent.filter(item => item.method === 'deleteMessage').length;
+  const safeResult = await worker.fetch(new Request('https://example.workers.dev/telegram/webhook', {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ update_id: 26, message: {
+      message_id: 26, chat: { id: -100500, type: 'supergroup', title: 'Тестовая группа' },
+      from: { id: 456, first_name: 'Тест', is_bot: false }, text: 'Хороший день, спасибо за помощь!' },
+    }),
+  }), env, ctx);
+  assert(safeResult.status === 200, 'normal message webhook failed');
+  await ctx.promise;
+  assert(sent.filter(item => item.method === 'deleteMessage').length === safeBefore,
+    'normal text was incorrectly flagged as profanity');
+  console.log('PASS: profanity moderation, obfuscated spellings, and safe-text false-positive check validated.');
 } finally {
   globalThis.fetch = originalFetch;
 }

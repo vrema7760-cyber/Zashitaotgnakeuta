@@ -108,22 +108,58 @@ async function handleJoinRequest(join, env) {
   if (!cfg?.enabled) return;
 
   const count = await countJoin(env, join.chat.id);
-  if (count >= cfg.threshold) {
-    await notifyUsers(env, cfg.admins,
-      `⚠️ <b>Возможная подозрительная активность</b>\nКанал: ${escapeHtml(cfg.title)}\nЗа минуту поступило ${count} заявок на вступление.`);
+  const threshold = Math.max(2, Number(cfg.threshold) || DEFAULT_THRESHOLD);
+  if (count >= threshold) {
+    const modeActivated = cfg.mode !== "protect";
+    if (modeActivated) {
+      cfg.mode = "protect";
+      await env.STATE.put(channelKey(join.chat.id), JSON.stringify(cfg));
+    }
+
+    const minute = Math.floor(Date.now() / 60000);
+    const alertKey = `join-raid-alert:${String(join.chat.id)}:${minute}`;
+    if (!(await env.STATE.get(alertKey))) {
+      await env.STATE.put(alertKey, "1", { expirationTtl: 180 });
+      await notifyUsers(env, cfg.admins,
+        `⚠️ <b>Возможная подозрительная активность</b>\nКанал: ${escapeHtml(cfg.title)}\nЗа минуту поступило ${count} заявок на вступление.\n` +
+        (modeActivated
+          ? "🛡 Автоматически включён режим protect: новые аккаунты, которые Telegram явно помечает как ботов, будут блокироваться."
+          : "🛡 Режим protect уже включён: аккаунты, которые Telegram явно помечает как ботов, будут блокироваться.") +
+        "\n⚠️ Перевести публичный канал в частный через Telegram Bot API невозможно — это должен сделать владелец в настройках канала.");
+    }
   }
 
   const user = join.from;
   if (user?.is_bot === true) {
-    const action = cfg.mode === "protect" ? "заявка отклонена" : "обнаружен";
-    await recordBot(env, user, cfg, action);
+    let action = "обнаружен";
+    let failure = "";
     if (cfg.mode === "protect") {
-      await telegram(env, "declineChatJoinRequest", { chat_id: join.chat.id, user_id: user.id });
+      const ban = await telegram(env, "banChatMember", {
+        chat_id: join.chat.id,
+        user_id: user.id,
+        revoke_messages: true,
+      });
+      if (ban.ok) {
+        action = "заблокирован";
+      } else {
+        const decline = await telegram(env, "declineChatJoinRequest", {
+          chat_id: join.chat.id,
+          user_id: user.id,
+        });
+        if (decline.ok) {
+          action = "заявка отклонена (бан не применился)";
+          failure = `\nПричина отказа в бане: ${escapeHtml(ban.description || "проверьте право can_restrict_members")}.`;
+        } else {
+          action = "не удалось заблокировать или отклонить заявку";
+          failure = `\nОшибка бана: ${escapeHtml(ban.description || "неизвестная ошибка")}.` +
+            `\nОшибка отклонения: ${escapeHtml(decline.description || "неизвестная ошибка")}.`;
+        }
+      }
     }
+    await recordBot(env, user, cfg, action);
     await notifyUsers(env, cfg.admins,
-      `🤖 ${action === "заявка отклонена" ? "Отклонена заявка" : "Обнаружен аккаунт"} Telegram-бота в канале ` +
-      `<b>${escapeHtml(cfg.title)}</b>: ${userLabel(user)}.\nID: <code>${user.id}</code>\n` +
-      `База обнаруженных ботов: /bots`);
+      `🤖 Telegram-бот ${action} в канале <b>${escapeHtml(cfg.title)}</b>: ${userLabel(user)}.\n` +
+      `ID: <code>${user.id}</code>${failure}\nБаза обнаруженных ботов: /bots`);
   } else if (count === 1 || count % 10 === 0) {
     await notifyUsers(env, cfg.admins,
       `📥 Канал: ${escapeHtml(cfg.title)}\nНовых заявок за минуту: ${count}.`);
@@ -158,18 +194,22 @@ async function handleChatMember(update, env) {
   if (!joined || user.is_bot !== true) return;
 
   let action = "обнаружен";
+  let failure = "";
   if (cfg.mode === "protect") {
     const result = await telegram(env, "banChatMember", {
       chat_id: update.chat.id,
       user_id: user.id,
       revoke_messages: true,
     });
-    action = result.ok ? "заблокирован" : "обнаружен (не удалось заблокировать)";
+    action = result.ok ? "заблокирован" : "не удалось заблокировать";
+    if (!result.ok) {
+      failure = `\\nОшибка Telegram: ${escapeHtml(result.description || "проверьте право can_restrict_members у бота")}.`;
+    }
   }
   await recordBot(env, user, cfg, action);
   await notifyUsers(env, cfg.admins,
-    `🤖 В канале <b>${escapeHtml(cfg.title)}</b> ${action} Telegram-бот: ${userLabel(user)}.\n` +
-    `ID: <code>${user.id}</code>\nБаза обнаруженных ботов: /bots`);
+    `🤖 В канале <b>${escapeHtml(cfg.title)}</b> ${action} Telegram-бот: ${userLabel(user)}.\\n` +
+    `ID: <code>${user.id}</code>${failure}\\nБаза обнаруженных ботов: /bots`);
 }
 
 function isChatMemberPresent(member) {
@@ -837,7 +877,7 @@ async function handleCallbackQuery(query, env, publicOrigin = "") {
     await env.STATE.put(channelKey(channelId), JSON.stringify(cfg));
   }
   return telegram(env, "editMessageText", { chat_id: chatId, message_id: messageId,
-    text: `⚙️ <b>${escapeHtml(cfg.title)}</b>\n\nРежим: <b>${escapeHtml(cfg.mode)}</b>\nПорог заявок: <b>${cfg.threshold}/мин</b>\n\nProtect автоматически отклоняет заявки от аккаунтов, помеченных Telegram как боты.`,
+    text: `⚙️ <b>${escapeHtml(cfg.title)}</b>\n\nРежим: <b>${escapeHtml(cfg.mode)}</b>\nПорог заявок: <b>${cfg.threshold}/мин</b>\n\nProtect блокирует аккаунты, которые Telegram явно помечает как ботов. При всплеске заявок режим включается автоматически. Публичность канала бот изменить не может.`,
     parse_mode: "HTML", reply_markup: channelActionsKeyboard(cfg) });
 }
 
